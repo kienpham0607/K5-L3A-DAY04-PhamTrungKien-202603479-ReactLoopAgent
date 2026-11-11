@@ -78,6 +78,59 @@ class LoopTests(unittest.TestCase):
         self.assertEqual(run_agent('x', fake, StatusTools())['status'], 'completed')
         self.assertEqual([m['tool_call_id'] for m in fake.histories[1][-2:]], ['a', 'b'])
 
+    def test_assistant_message_is_preserved_before_all_results(self):
+        response = tool_call('a', 'get_status', '{"provider":"github"}')
+        second = tool_call('b', 'get_status', '{"provider":"cloudflare"}')
+        response['calls'] += second['calls']
+        response['message']['tool_calls'] += second['message']['tool_calls']
+        response['message']['content'] = 'Kiểm tra cả hai provider.'
+        response['message']['provider_metadata'] = {'opaque': 'keep-me'}
+        response['usage'] = {'total_tokens': 42}
+        fake = FakeProvider([response, final()])
+
+        result = run_agent('kiểm tra', fake, StatusTools())
+
+        self.assertIs(fake.histories[1][2], response['message'])
+        self.assertEqual([m['role'] for m in fake.histories[1]],
+                         ['system', 'user', 'assistant', 'tool', 'tool'])
+        self.assertEqual(result['usage'], [{'total_tokens': 42}, {}])
+        events = [e for e in result['trace'] if e['event'] == 'tool']
+        self.assertEqual([e['step'] for e in events], [1, 1])
+        self.assertEqual(events[0]['arguments'], {'provider': 'github'})
+        self.assertEqual(events[1]['result']['provider'], 'cloudflare')
+
+    def test_non_object_arguments_are_observations(self):
+        for arguments in ('null', '[]', '"github"'):
+            with self.subTest(arguments=arguments):
+                fake = FakeProvider([tool_call('a', 'get_status', arguments), final()])
+                self.assertEqual(run_agent('x', fake, StatusTools())['status'], 'completed')
+                observation = json.loads(fake.histories[1][-1]['content'])
+                self.assertEqual(observation['error'], 'INVALID_ARGUMENTS')
+
+    def test_provider_exception_returns_error(self):
+        fake = FakeProvider([])
+        with patch.object(fake, 'complete', side_effect=RuntimeError('provider unavailable')):
+            result = run_agent('x', fake, StatusTools())
+        self.assertEqual(result['status'], 'error')
+        self.assertEqual(result['trace'][-1]['event'], 'provider_error')
+
+    def test_tool_exception_is_returned_with_id(self):
+        fake = FakeProvider([tool_call('a', 'get_status', '{"provider":"github"}'), final()])
+        tools = StatusTools()
+        with patch.object(tools, 'execute', side_effect=TimeoutError('timeout')):
+            result = run_agent('x', fake, tools)
+        self.assertEqual(result['status'], 'completed')
+        self.assertEqual(fake.histories[1][-1]['tool_call_id'], 'a')
+        self.assertEqual(json.loads(fake.histories[1][-1]['content'])['error'], 'TimeoutError')
+
+    def test_unexpected_finish_is_not_completed(self):
+        for finish in ('content_filter', 'tool_calls', None):
+            with self.subTest(finish=finish):
+                response = final('partial')
+                response['finish'] = finish
+                result = run_agent('x', FakeProvider([response]), StatusTools())
+                self.assertEqual(result['status'], 'error')
+
 
 class ProviderTests(unittest.TestCase):
     @patch.dict('os.environ', {'ANTHROPIC_API_KEY': 'test'})
@@ -125,3 +178,7 @@ class FullTrajectoryTests(unittest.TestCase):
                 self.assertEqual(result['finish'], 'stop')
                 self.assertEqual(post.call_args.args[2]['model'], 'test-model')
                 self.assertIn('chat/completions', post.call_args.args[0])
+                if name == 'openrouter':
+                    self.assertEqual(post.call_args.args[2]['max_tokens'], 1024)
+                else:
+                    self.assertNotIn('max_tokens', post.call_args.args[2])

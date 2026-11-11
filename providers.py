@@ -45,6 +45,9 @@ class Provider:
         if self.name == 'anthropic':
             return self._anthropic(messages, schemas)
         payload = {'model': self.model, 'messages': messages}
+        if self.name == 'openrouter':
+            # Tránh xin toàn bộ output budget của model (có thể gây HTTP 402).
+            payload['max_tokens'] = 1024
         if schemas:
             payload['tools'] = schemas
         data = post_json(self.url, {'Authorization': f'Bearer {self.key}'}, payload)
